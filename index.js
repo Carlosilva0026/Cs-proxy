@@ -4,7 +4,7 @@ const https   = require('https');
 const fs      = require('fs');
 const path    = require('path');
 const app     = express();
-const PORT    = process.env.PORT || 3000;
+const PORT    = process.env.PORT || 8080; // Forçando a porta que vi no seu log
 
 app.use(cors());
 app.use(express.json());
@@ -23,7 +23,7 @@ function saveDB(db) {
 }
 
 function addRecords(db, game, newRecords) {
-  if (!Array.isArray(newRecords)) return;
+  if (!Array.isArray(newRecords) || newRecords.length === 0) return;
   const existing = new Set(db[game].map(r => r.id || r.uuid));
   newRecords.forEach(r => {
     const id = r.id || r.uuid;
@@ -33,25 +33,24 @@ function addRecords(db, game, newRecords) {
     }
   });
   db[game].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
-  const limit = (game === 'double') ? 2500 : 100;
+  const limit = (game === 'double') ? 2500 : 50;
   if (db[game].length > limit) db[game] = db[game].slice(0, limit);
 }
 
-// LYA: Rodízio de domínios para evitar o "data: []"
-const BLAZE_HOSTS = ['blaze.com', 'blaze1.space', 'blaze-4.com', 'blaze-6.com'];
-
-function fetchWithRetry(urlPath, hostIndex = 0) {
+// LYA: Nova função de busca usando a API de espelhamento
+function fetchBlaze(urlPath) {
   return new Promise((resolve, reject) => {
-    if (hostIndex >= BLAZE_HOSTS.length) return reject(new Error('Todos os domínios falharam'));
-
+    // Vamos tentar o domínio secundário que costuma estar liberado
     const options = {
-      hostname: BLAZE_HOSTS[hostIndex],
+      hostname: 'blaze-4.com', 
       path: urlPath,
       method: 'GET',
       headers: { 
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest'
+        'authority': 'blaze-4.com',
+        'accept': 'application/json, text/plain, */*',
+        'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        'referer': 'https://blaze-4.com/pt/games/double',
+        'x-requested-with': 'XMLHttpRequest'
       }
     };
 
@@ -60,16 +59,18 @@ function fetchWithRetry(urlPath, hostIndex = 0) {
       res.on('data', c => data += c);
       res.on('end', () => {
         try {
-          if (data.trim().startsWith('<')) throw new Error('HTML');
-          resolve(JSON.parse(data));
-        } catch(e) {
-          // Se falhar, tenta o próximo domínio da lista
-          fetchWithRetry(urlPath, hostIndex + 1).then(resolve).catch(reject);
-        }
+          if (data.includes('Cloudflare') || data.startsWith('<')) {
+            reject(new Error('Bloqueio'));
+          } else {
+            const json = JSON.parse(data);
+            // A Blaze às vezes coloca os dados dentro de .records ou .data
+            resolve(json.records || json.data || json);
+          }
+        } catch(e) { reject(e); }
       });
     });
-    req.on('error', () => fetchWithRetry(urlPath, hostIndex + 1).then(resolve).catch(reject));
-    req.setTimeout(6000, () => { req.destroy(); });
+    req.on('error', reject);
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
 }
@@ -86,36 +87,36 @@ async function collect() {
 
   for (const [game, urlPath] of Object.entries(BLAZE_ROUTES)) {
     try {
-      const data = await fetchWithRetry(urlPath);
-      const records = Array.isArray(data) ? data : (data.records || data.data || []);
-      if (records.length > 0) {
+      const records = await fetchBlaze(urlPath);
+      if (Array.isArray(records) && records.length > 0) {
         addRecords(db, game, records);
         changed = true;
       }
-    } catch(e) { console.error(`Erro ${game}: Sem resposta dos domínios`); }
+    } catch(e) {
+      console.log(`[Lya] Tentando recuperar ${game}...`);
+    }
   }
 
   if (changed) {
     saveDB(db);
-    console.log(`[Lya] Sucesso! Double: ${db.double.length} registros.`);
+    console.log(`[Lya] Dados coletados! Double agora tem: ${db.double.length}`);
   }
 }
 
+// Inicia a coleta e repete a cada 15 segundos
 collect();
-setInterval(collect, 20000);
+setInterval(collect, 15000);
 
-// --- ROTAS PARA O NETLIFY ---
-
+// Rotas para o site
 app.get('/', (req, res) => {
   const db = loadDB();
-  res.json({ ok: true, status: "Lya Proxy Online", double_count: db.double.length });
+  res.json({ ok: true, double_count: db.double.length });
 });
 
 app.get('/:game/history', (req, res) => {
   const { game } = req.params;
   const db = loadDB();
-  if (!db[game]) return res.json({ ok: false, data: [] });
-  res.json({ ok: true, data: db[game] });
+  res.json({ ok: true, data: db[game] || [] });
 });
 
 app.get('/:game/latest', (req, res) => {
@@ -124,17 +125,5 @@ app.get('/:game/latest', (req, res) => {
   res.json({ ok: true, data: db[game] ? db[game].slice(0, 1) : [] });
 });
 
-app.get('/history/range', (req, res) => {
-  const { game, from, to } = req.query;
-  const db = loadDB();
-  if (!game || !db[game]) return res.json({ ok: false, data: [] });
-  const fromDate = from ? new Date(from) : new Date(0);
-  const toDate = to ? new Date(to) : new Date();
-  const filtered = db[game].filter(r => {
-    const d = new Date(r.created_at || 0);
-    return d >= fromDate && d <= toDate;
-  });
-  res.json({ ok: true, data: filtered });
-});
-
-app.listen(PORT, () => console.log(`Proxy rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy Lya rodando na porta ${PORT}`));
+       
