@@ -9,7 +9,6 @@ const PORT    = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ── Banco de dados (Arquivo JSON) ──────────────────
 const DB_FILE = path.join('/tmp', 'cs_db.json');
 
 function loadDB() {
@@ -26,31 +25,32 @@ function saveDB(db) {
 function addRecords(db, game, newRecords) {
   if (!Array.isArray(newRecords)) return;
   const existing = new Set(db[game].map(r => r.id || r.uuid));
-  for (const r of newRecords) {
+  newRecords.forEach(r => {
     const id = r.id || r.uuid;
     if (id && !existing.has(id)) {
       db[game].push(r);
       existing.add(id);
     }
-  }
+  });
   db[game].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
-  
-  // Memória: 2500 para Double (24h), 100 para os outros
   const limit = (game === 'double') ? 2500 : 100;
   if (db[game].length > limit) db[game] = db[game].slice(0, limit);
 }
 
-// ── Fetch da Blaze com Headers Reais ─────────────────
-function blazeFetch(urlPath) {
+// LYA: Rodízio de domínios para evitar o "data: []"
+const BLAZE_HOSTS = ['blaze.com', 'blaze1.space', 'blaze-4.com', 'blaze-6.com'];
+
+function fetchWithRetry(urlPath, hostIndex = 0) {
   return new Promise((resolve, reject) => {
+    if (hostIndex >= BLAZE_HOSTS.length) return reject(new Error('Todos os domínios falharam'));
+
     const options = {
-      hostname: 'blaze.com',
+      hostname: BLAZE_HOSTS[hostIndex],
       path: urlPath,
       method: 'GET',
       headers: { 
         'Accept': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://blaze.com/pt/games/double',
         'X-Requested-With': 'XMLHttpRequest'
       }
     };
@@ -59,19 +59,21 @@ function blazeFetch(urlPath) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        try { 
-          if (data.trim().startsWith('<')) return reject(new Error('HTML_ERROR'));
-          resolve(JSON.parse(data)); 
-        } catch(e) { reject(new Error('PARSE_ERROR')); }
+        try {
+          if (data.trim().startsWith('<')) throw new Error('HTML');
+          resolve(JSON.parse(data));
+        } catch(e) {
+          // Se falhar, tenta o próximo domínio da lista
+          fetchWithRetry(urlPath, hostIndex + 1).then(resolve).catch(reject);
+        }
       });
     });
-    req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('TIMEOUT')); });
+    req.on('error', () => fetchWithRetry(urlPath, hostIndex + 1).then(resolve).catch(reject));
+    req.setTimeout(6000, () => { req.destroy(); });
     req.end();
   });
 }
 
-// ── Coleta Automática ─────────────────────────────
 const BLAZE_ROUTES = {
   double: '/api/roulette_games/recent',
   crash:  '/api/crash_games/recent',
@@ -84,64 +86,55 @@ async function collect() {
 
   for (const [game, urlPath] of Object.entries(BLAZE_ROUTES)) {
     try {
-      const data = await blazeFetch(urlPath);
+      const data = await fetchWithRetry(urlPath);
       const records = Array.isArray(data) ? data : (data.records || data.data || []);
-      if (records.length) { addRecords(db, game, records); changed = true; }
-    } catch(e) { console.error(`Erro ${game}:`, e.message); }
+      if (records.length > 0) {
+        addRecords(db, game, records);
+        changed = true;
+      }
+    } catch(e) { console.error(`Erro ${game}: Sem resposta dos domínios`); }
   }
 
-  if (changed) saveDB(db);
+  if (changed) {
+    saveDB(db);
+    console.log(`[Lya] Sucesso! Double: ${db.double.length} registros.`);
+  }
 }
 
 collect();
-setInterval(collect, 15000);
+setInterval(collect, 20000);
 
-// ── Rotas Exigidas pelo Front-end ──────────────────
+// --- ROTAS PARA O NETLIFY ---
 
-// Rota raiz que o botão "TESTAR" valida
 app.get('/', (req, res) => {
   const db = loadDB();
-  res.json({
-    ok: true, // Essencial para o seu site aceitar
-    status: 'ok',
-    service: 'CS Suite Proxy',
-    records: { double: db.double.length, crash: db.crash.length, crash2: db.crash2.length },
-    ts: new Date().toISOString()
-  });
+  res.json({ ok: true, status: "Lya Proxy Online", double_count: db.double.length });
 });
 
-// Rota de histórico que o site usa para as listas
 app.get('/:game/history', (req, res) => {
   const { game } = req.params;
   const db = loadDB();
-  if (!db[game]) return res.status(404).json({ ok: false });
+  if (!db[game]) return res.json({ ok: false, data: [] });
   res.json({ ok: true, data: db[game] });
 });
 
-// Rota de range (Filtros do dia anterior)
+app.get('/:game/latest', (req, res) => {
+  const { game } = req.params;
+  const db = loadDB();
+  res.json({ ok: true, data: db[game] ? db[game].slice(0, 1) : [] });
+});
+
 app.get('/history/range', (req, res) => {
   const { game, from, to } = req.query;
   const db = loadDB();
-  if (!game || !db[game]) return res.status(400).json({ ok: false });
-
+  if (!game || !db[game]) return res.json({ ok: false, data: [] });
   const fromDate = from ? new Date(from) : new Date(0);
-  const toDate   = to   ? new Date(to)   : new Date();
-
+  const toDate = to ? new Date(to) : new Date();
   const filtered = db[game].filter(r => {
     const d = new Date(r.created_at || 0);
     return d >= fromDate && d <= toDate;
   });
-
   res.json({ ok: true, data: filtered });
 });
 
-// Rota para o último resultado individual
-app.get('/:game/latest', (req, res) => {
-  const { game } = req.params;
-  const db = loadDB();
-  if (!db[game]) return res.status(404).json({ ok: false });
-  res.json({ ok: true, data: db[game].slice(0, 1) });
-});
-
-app.listen(PORT, () => console.log(`Proxy Lya Ativo na porta ${PORT}`));
-            
+app.listen(PORT, () => console.log(`Proxy rodando na porta ${PORT}`));
