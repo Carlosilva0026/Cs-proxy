@@ -15,12 +15,12 @@ const DB_FILE = path.join('/tmp', 'cs_db.json');
 function loadDB() {
   try {
     if (fs.existsSync(DB_FILE)) return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch(e) { console.log("Lya: Iniciando novo banco de dados..."); }
+  } catch(e) { console.log("Lya: Iniciando novo armazenamento..."); }
   return { double: [], crash: [], crash2: [] };
 }
 
 function saveDB(db) {
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) { console.error("Erro ao salvar DB:", e); }
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) { console.error("Erro ao salvar:", e); }
 }
 
 function addRecords(db, game, newRecords) {
@@ -37,7 +37,7 @@ function addRecords(db, game, newRecords) {
 
   db[game].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 
-  // Configuração solicitada: Double com histórico longo (24h), Crash apenas recente
+  // Double com histórico para estratégia (2500 rodadas), Crash apenas recente
   if (game === 'double') {
     if (db[game].length > 2500) db[game] = db[game].slice(0, 2500);
   } else {
@@ -45,18 +45,16 @@ function addRecords(db, game, newRecords) {
   }
 }
 
-// Função de busca com Headers reforçados para evitar bloqueio "Erro no JSON"
 function blazeFetch(urlPath) {
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: 'blaze.com', // Usando domínio principal
+      hostname: 'blaze.com',
       path: urlPath,
       method: 'GET',
       headers: { 
         'Accept': 'application/json, text/plain, */*',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Referer': 'https://blaze.com/pt/games/double',
-        'Origin': 'https://blaze.com',
         'X-Requested-With': 'XMLHttpRequest'
       }
     };
@@ -67,13 +65,11 @@ function blazeFetch(urlPath) {
       res.on('end', () => {
         try { 
           if (data.trim().startsWith('<')) {
-            reject(new Error('Bloqueio Cloudflare (HTML)'));
+            reject(new Error('Bloqueio Cloudflare'));
           } else {
             resolve(JSON.parse(data));
           }
-        } catch(e) { 
-          reject(new Error('Resposta não é JSON')); 
-        }
+        } catch(e) { reject(new Error('Resposta Inválida')); }
       });
     });
 
@@ -97,27 +93,39 @@ async function collect() {
     try {
       const data = await blazeFetch(urlPath);
       const records = Array.isArray(data) ? data : (data.records || data.data || []);
-      
       if (records.length > 0) {
         addRecords(db, game, records);
         changed = true;
       }
     } catch(e) {
-      console.error(`[Lya Log] Erro no ${game}: ${e.message}`);
+      console.error(`[Lya Log] Erro ${game}: ${e.message}`);
     }
   }
 
   if (changed) {
     saveDB(db);
-    console.log(`[Lya Log] Atualizado: Double: ${db.double.length} | Crash: ${db.crash.length}`);
+    console.log(`[Lya Log] Database atualizada. Double: ${db.double.length}`);
   }
 }
 
-// Coleta a cada 20 segundos para evitar sobrecarga e bloqueio
+// Coleta a cada 20 segundos
 collect();
 setInterval(collect, 20000);
 
-// Rotas da API
+// --- ROTAS PARA O SITE (NETLIFY) ---
+
+// Rota de teste que o botão "TESTAR" do site chama
+app.get('/', (req, res) => {
+  const db = loadDB();
+  res.json({ 
+    ok: true, 
+    status: "Online", 
+    double_count: db.double.length,
+    monitor: "Lya Suite Active"
+  });
+});
+
+// Rota que entrega o histórico para as listas do site
 app.get('/:game/history', (req, res) => {
   const { game } = req.params;
   const db = loadDB();
@@ -125,14 +133,4 @@ app.get('/:game/history', (req, res) => {
   res.json({ ok: true, data: db[game] });
 });
 
-app.get('/', (req, res) => {
-  const db = loadDB();
-  res.json({ 
-    status: "Online", 
-    monitor: "Lya Suite",
-    double_count: db.double.length,
-    ts: new Date().toISOString()
-  });
-});
-
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy rodando na porta ${PORT}`));
