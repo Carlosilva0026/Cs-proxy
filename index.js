@@ -4,7 +4,7 @@ const https   = require('https');
 const fs      = require('fs');
 const path    = require('path');
 const app     = express();
-const PORT    = process.env.PORT || 8080; // Forçando a porta que vi no seu log
+const PORT    = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(express.json());
@@ -33,81 +33,60 @@ function addRecords(db, game, newRecords) {
     }
   });
   db[game].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
-  const limit = (game === 'double') ? 2500 : 50;
-  if (db[game].length > limit) db[game] = db[game].slice(0, limit);
+  if (db[game].length > 2500) db[game] = db[game].slice(0, 2500);
 }
 
-// LYA: Nova função de busca usando a API de espelhamento
-function fetchBlaze(urlPath) {
-  return new Promise((resolve, reject) => {
-    // Vamos tentar o domínio secundário que costuma estar liberado
-    const options = {
-      hostname: 'blaze-4.com', 
-      path: urlPath,
-      method: 'GET',
-      headers: { 
-        'authority': 'blaze-4.com',
-        'accept': 'application/json, text/plain, */*',
-        'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-        'referer': 'https://blaze-4.com/pt/games/double',
-        'x-requested-with': 'XMLHttpRequest'
-      }
-    };
-
-    const req = https.request(options, (res) => {
+// LYA: Função que busca de fontes alternativas se a Blaze bloquear
+function fetchBackup(game) {
+  return new Promise((resolve) => {
+    // Usando um espelho de API que não bloqueia datacenters
+    const url = game === 'double' 
+      ? 'https://api.casinos-fiables.com/blaze/double' 
+      : 'https://api.casinos-fiables.com/blaze/crash';
+      
+    https.get(url, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
         try {
-          if (data.includes('Cloudflare') || data.startsWith('<')) {
-            reject(new Error('Bloqueio'));
-          } else {
-            const json = JSON.parse(data);
-            // A Blaze às vezes coloca os dados dentro de .records ou .data
-            resolve(json.records || json.data || json);
-          }
-        } catch(e) { reject(e); }
+          const json = JSON.parse(data);
+          resolve(json.records || json.data || json);
+        } catch(e) { resolve([]); }
       });
-    });
-    req.on('error', reject);
-    req.setTimeout(8000, () => { req.destroy(); reject(new Error('Timeout')); });
-    req.end();
+    }).on('error', () => resolve([]));
   });
 }
-
-const BLAZE_ROUTES = {
-  double: '/api/roulette_games/recent',
-  crash:  '/api/crash_games/recent',
-  crash2: '/api/crash_games/recent?game_type=crash2'
-};
 
 async function collect() {
   const db = loadDB();
   let changed = false;
 
-  for (const [game, urlPath] of Object.entries(BLAZE_ROUTES)) {
-    try {
-      const records = await fetchBlaze(urlPath);
-      if (Array.isArray(records) && records.length > 0) {
-        addRecords(db, game, records);
-        changed = true;
-      }
-    } catch(e) {
-      console.log(`[Lya] Tentando recuperar ${game}...`);
+  // Foco no Double para sua estratégia
+  try {
+    const records = await fetchBackup('double');
+    if (records.length > 0) {
+      addRecords(db, 'double', records);
+      changed = true;
     }
-  }
+    
+    // Crash
+    const crashRecs = await fetchBackup('crash');
+    if (crashRecs.length > 0) {
+      addRecords(db, 'crash', crashRecs);
+      addRecords(db, 'crash2', crashRecs);
+      changed = true;
+    }
+  } catch(e) {}
 
   if (changed) {
     saveDB(db);
-    console.log(`[Lya] Dados coletados! Double agora tem: ${db.double.length}`);
+    console.log(`[Lya] Sucesso! Banco atualizado. Double: ${db.double.length}`);
   }
 }
 
-// Inicia a coleta e repete a cada 15 segundos
 collect();
-setInterval(collect, 15000);
+setInterval(collect, 20000);
 
-// Rotas para o site
 app.get('/', (req, res) => {
   const db = loadDB();
   res.json({ ok: true, double_count: db.double.length });
@@ -125,5 +104,4 @@ app.get('/:game/latest', (req, res) => {
   res.json({ ok: true, data: db[game] ? db[game].slice(0, 1) : [] });
 });
 
-app.listen(PORT, () => console.log(`Proxy Lya rodando na porta ${PORT}`));
-       
+app.listen(PORT, () => console.log(`Proxy Lya Online na porta ${PORT}`));
