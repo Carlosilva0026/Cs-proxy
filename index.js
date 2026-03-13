@@ -9,17 +9,18 @@ const PORT    = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Armazenamento temporário no Railway
 const DB_FILE = path.join('/tmp', 'cs_db.json');
 
 function loadDB() {
   try {
     if (fs.existsSync(DB_FILE)) return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch(e) { console.log("Lya: Iniciando novo armazenamento..."); }
+  } catch(e) { console.log("Lya: Iniciando novo banco de dados..."); }
   return { double: [], crash: [], crash2: [] };
 }
 
 function saveDB(db) {
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) { console.error("Erro ao salvar:", e); }
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) { console.error("Erro ao salvar DB:", e); }
 }
 
 function addRecords(db, game, newRecords) {
@@ -36,24 +37,27 @@ function addRecords(db, game, newRecords) {
 
   db[game].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
 
-  // --- CONFIGURAÇÃO DE MEMÓRIA DA LYA ---
+  // Configuração solicitada: Double com histórico longo (24h), Crash apenas recente
   if (game === 'double') {
-    if (db[game].length > 2500) db[game] = db[game].slice(0, 2500); // 24h+ de Double
+    if (db[game].length > 2500) db[game] = db[game].slice(0, 2500);
   } else {
-    if (db[game].length > 100) db[game] = db[game].slice(0, 100);   // Apenas histórico recente
+    if (db[game].length > 50) db[game] = db[game].slice(0, 50);
   }
 }
 
+// Função de busca com Headers reforçados para evitar bloqueio "Erro no JSON"
 function blazeFetch(urlPath) {
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: 'blaze1.space',
+      hostname: 'blaze.com', // Usando domínio principal
       path: urlPath,
       method: 'GET',
       headers: { 
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://blaze1.space/'
+        'Accept': 'application/json, text/plain, */*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Referer': 'https://blaze.com/pt/games/double',
+        'Origin': 'https://blaze.com',
+        'X-Requested-With': 'XMLHttpRequest'
       }
     };
 
@@ -61,12 +65,20 @@ function blazeFetch(urlPath) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('Erro no JSON')); }
+        try { 
+          if (data.trim().startsWith('<')) {
+            reject(new Error('Bloqueio Cloudflare (HTML)'));
+          } else {
+            resolve(JSON.parse(data));
+          }
+        } catch(e) { 
+          reject(new Error('Resposta não é JSON')); 
+        }
       });
     });
+
     req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
 }
@@ -91,30 +103,36 @@ async function collect() {
         changed = true;
       }
     } catch(e) {
-      console.error(`Erro ${game}:`, e.message);
+      console.error(`[Lya Log] Erro no ${game}: ${e.message}`);
     }
   }
 
   if (changed) {
     saveDB(db);
-    console.log(`Status: Double(${db.double.length}) | Crash(${db.crash.length})`);
+    console.log(`[Lya Log] Atualizado: Double: ${db.double.length} | Crash: ${db.crash.length}`);
   }
 }
 
-// Coleta a cada 15 segundos
+// Coleta a cada 20 segundos para evitar sobrecarga e bloqueio
 collect();
-setInterval(collect, 15000);
+setInterval(collect, 20000);
 
-// Rota para o Front-end pegar os dados
+// Rotas da API
 app.get('/:game/history', (req, res) => {
   const { game } = req.params;
   const db = loadDB();
-  if (!db[game]) return res.status(404).send("Jogo não existe");
+  if (!db[game]) return res.status(404).json({ ok: false, msg: "Jogo inválido" });
   res.json({ ok: true, data: db[game] });
 });
 
 app.get('/', (req, res) => {
-  res.send("CS Suite Proxy Ativo - Lya");
+  const db = loadDB();
+  res.json({ 
+    status: "Online", 
+    monitor: "Lya Suite",
+    double_count: db.double.length,
+    ts: new Date().toISOString()
+  });
 });
 
-app.listen(PORT, () => console.log(`Proxy rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
