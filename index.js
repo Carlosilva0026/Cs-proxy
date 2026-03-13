@@ -6,20 +6,22 @@ const PORT    = process.env.PORT || 8080;
 
 app.use(cors());
 
-// Banco de dados em memória
-let cache = { double: [], crash: [] };
+// Cache para armazenar os dados e não deixar o site vazio
+let cache = { double: [], crash: [], crash2: [] };
 
-// LYA: Função que traduz os dados para o formato exato da Blaze
-function formatBlaze(item) {
+// Função para formatar os dados como o seu HTML 'hstone' espera
+function formatToBlaze(item) {
+    const colorMap = { 0: 'white', 1: 'red', 2: 'black' };
     return {
-        id: item.id || Math.random(),
-        color: item.color || (item.roll <= 7 ? 'red' : 'black'), // Traduz número em cor
-        roll: item.roll || item.value || 0,
+        id: item.id || Math.random().toString(),
+        color: item.color || colorMap[item.color_index] || 'red',
+        value: item.roll || item.value || 0,
         created_at: item.created_at || new Date().toISOString()
     };
 }
 
-function fetchExternal() {
+// Coletor de dados de fonte estável (sem bloqueio)
+function updateData() {
     https.get('https://api.casinos-fiables.com/blaze/double', (res) => {
         let data = '';
         res.on('data', d => data += d);
@@ -28,20 +30,20 @@ function fetchExternal() {
                 const json = JSON.parse(data);
                 const records = json.records || json.data || json;
                 if (Array.isArray(records)) {
-                    // Mapeia e traduz cada item para o padrão da Blaze
-                    cache.double = records.map(formatBlaze);
-                    console.log(`[Lya] ${cache.double.length} rodadas formatadas.`);
+                    // Aqui transformamos os dados no formato que o seu 'hstone' lê
+                    cache.double = records.slice(0, 50).map(formatToBlaze);
+                    console.log(`[Lya] Sucesso: ${cache.double.length} pedras prontas.`);
                 }
-            } catch(e) { console.log("Erro na formatação."); }
+            } catch(e) { console.log("[Lya] Erro ao processar JSON."); }
         });
-    }).on('error', () => {});
+    }).on('error', (err) => console.log("[Lya] Erro de conexão."));
 }
 
-setInterval(fetchExternal, 20000);
-fetchExternal();
+// Atualiza a cada 20 segundos
+setInterval(updateData, 20000);
+updateData();
 
-app.get('/', (req, res) => res.json({ ok: true, double_count: cache.double.length }));
-
+// Rotas exigidas pelo seu arquivo HTML (cs-suite-mobile.html)
 app.get('/:game/history', (req, res) => {
     res.json({ ok: true, data: cache[req.params.game] || [] });
 });
@@ -51,7 +53,8 @@ app.get('/:game/latest', (req, res) => {
     res.json({ ok: true, data: list.slice(0, 1) });
 });
 
-// Rotas extras que o seu site pode estar pedindo
-app.get('/history/range', (req, res) => res.json({ ok: true, data: cache.double }));
+app.get('/', (req, res) => {
+    res.json({ status: "Lya Proxy Online", count: cache.double.length });
+});
 
-app.listen(PORT, () => console.log(`Lya Suite Final na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy configurado para CS Suite na porta ${PORT}`));
