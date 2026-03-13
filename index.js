@@ -9,150 +9,112 @@ const PORT    = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ── Banco de dados simples (arquivo JSON) ──────────────────
 const DB_FILE = path.join('/tmp', 'cs_db.json');
 
 function loadDB() {
   try {
     if (fs.existsSync(DB_FILE)) return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch(e) {}
+  } catch(e) { console.log("Lya: Iniciando novo armazenamento..."); }
   return { double: [], crash: [], crash2: [] };
 }
+
 function saveDB(db) {
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) {}
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch(e) { console.error("Erro ao salvar:", e); }
 }
 
-// Mantém no máximo 5000 registros por jogo
 function addRecords(db, game, newRecords) {
-  const existing = new Set(db[game].map(r => r.id));
-  for (const r of newRecords) {
-    if (!existing.has(r.id)) {
+  if (!Array.isArray(newRecords)) return;
+  
+  const existing = new Set(db[game].map(r => r.id || r.uuid));
+  newRecords.forEach(r => {
+    const id = r.id || r.uuid;
+    if (id && !existing.has(id)) {
       db[game].push(r);
-      existing.add(r.id);
+      existing.add(id);
     }
+  });
+
+  db[game].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+
+  // --- CONFIGURAÇÃO DE MEMÓRIA DA LYA ---
+  if (game === 'double') {
+    if (db[game].length > 2500) db[game] = db[game].slice(0, 2500); // 24h+ de Double
+  } else {
+    if (db[game].length > 100) db[game] = db[game].slice(0, 100);   // Apenas histórico recente
   }
-  // ordena por data decrescente e limita
-  db[game].sort((a, b) => new Date(b.created_at||0) - new Date(a.created_at||0));
-  if (db[game].length > 5000) db[game] = db[game].slice(0, 5000);
 }
 
-// ── Fetch da Blaze ─────────────────────────────────────────
 function blazeFetch(urlPath) {
-  // tenta crash_2 se crash2 falhar (fallback automático)
   return new Promise((resolve, reject) => {
-    const req = https.request({
+    const options = {
       hostname: 'blaze1.space',
       path: urlPath,
       method: 'GET',
-      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-    }, (res) => {
+      headers: { 
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://blaze1.space/'
+      }
+    };
+
+    const req = https.request(options, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('parse')); }
+        catch(e) { reject(new Error('Erro no JSON')); }
       });
     });
     req.on('error', reject);
-    req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.end();
   });
 }
 
-// Tenta crash_2, fallback para crash-2
-async function fetchCrash2(endpoint) {
-  try {
-    return await blazeFetch(`/api/singleplayer-originals/originals/crash_2/${endpoint}`);
-  } catch(e) {
-    return await blazeFetch(`/api/singleplayer-originals/originals/crash-2/${endpoint}`);
-  }
-}
-
-// ── Coleta automática a cada 10s ───────────────────────────
 const BLAZE_ROUTES = {
-  double: '/api/singleplayer-originals/originals/double/history',
-  crash:  '/api/singleplayer-originals/originals/crash/history',
+  double: '/api/roulette_games/recent',
+  crash:  '/api/crash_games/recent',
+  crash2: '/api/crash_games/recent?game_type=crash2'
 };
 
 async function collect() {
   const db = loadDB();
   let changed = false;
 
-  // Double e Crash
   for (const [game, urlPath] of Object.entries(BLAZE_ROUTES)) {
     try {
       const data = await blazeFetch(urlPath);
-      const records = Array.isArray(data) ? data : (data.data || data.records || []);
-      if (records.length) { addRecords(db, game, records); changed = true; }
-    } catch(e) { /* silencioso */ }
+      const records = Array.isArray(data) ? data : (data.records || data.data || []);
+      
+      if (records.length > 0) {
+        addRecords(db, game, records);
+        changed = true;
+      }
+    } catch(e) {
+      console.error(`Erro ${game}:`, e.message);
+    }
   }
 
-  // Crash2 com fallback
-  try {
-    const data = await fetchCrash2('history');
-    const records = Array.isArray(data) ? data : (data.data || data.records || []);
-    if (records.length) { addRecords(db, 'crash2', records); changed = true; }
-  } catch(e) { /* silencioso */ }
-
-  if (changed) saveDB(db);
+  if (changed) {
+    saveDB(db);
+    console.log(`Status: Double(${db.double.length}) | Crash(${db.crash.length})`);
+  }
 }
 
-// Coleta imediata + a cada 10 segundos
+// Coleta a cada 15 segundos
 collect();
-setInterval(collect, 10000);
+setInterval(collect, 15000);
 
-// ── Rotas ──────────────────────────────────────────────────
+// Rota para o Front-end pegar os dados
+app.get('/:game/history', (req, res) => {
+  const { game } = req.params;
+  const db = loadDB();
+  if (!db[game]) return res.status(404).send("Jogo não existe");
+  res.json({ ok: true, data: db[game] });
+});
 
 app.get('/', (req, res) => {
-  const db = loadDB();
-  res.json({
-    status: 'ok',
-    service: 'CS Suite Proxy',
-    records: { double: db.double.length, crash: db.crash.length, crash2: db.crash2.length },
-    ts: new Date().toISOString()
-  });
+  res.send("CS Suite Proxy Ativo - Lya");
 });
 
-// Últimos N resultados
-app.get('/:game/latest', async (req, res) => {
-  const game = req.params.game;
-  if (!['double','crash','crash2'].includes(game)) return res.status(404).json({ ok:false });
-  try {
-    let data;
-    if (game === 'crash2') {
-      data = await fetchCrash2('search/1');
-    } else {
-      data = await blazeFetch(`/api/singleplayer-originals/originals/${game}/search/1`);
-    }
-    res.json({ ok:true, data });
-  } catch(e) {
-    // fallback: retorna do banco
-    const db = loadDB();
-    res.json({ ok:true, data: db[game].slice(0,1) });
-  }
-});
-
-// Histórico completo do banco
-app.get('/:game/history', (req, res) => {
-  const game = req.params.game;
-  if (!['double','crash','crash2'].includes(game)) return res.status(404).json({ ok:false });
-  const db = loadDB();
-  res.json({ ok:true, data: db[game] });
-});
-
-// Histórico por intervalo de datas (para as listas)
-app.get('/history/range', (req, res) => {
-  const { game, from, to } = req.query;
-  if (!game || !['double','crash','crash2'].includes(game))
-    return res.status(400).json({ ok:false, error:'game invalido' });
-  const db = loadDB();
-  const fromDate = from ? new Date(from) : new Date(0);
-  const toDate   = to   ? new Date(to)   : new Date();
-  const filtered = db[game].filter(r => {
-    const d = new Date(r.created_at || 0);
-    return d >= fromDate && d <= toDate;
-  });
-  res.json({ ok:true, data: filtered });
-});
-
-app.listen(PORT, () => console.log(`CS Suite Proxy rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy rodando na porta ${PORT}`));
