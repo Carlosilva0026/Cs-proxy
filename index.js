@@ -2,14 +2,13 @@ const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
 const app     = express();
-const PORT    = process.env.PORT || 8080;
 
+// O Railway define a porta automaticamente, mas o seu HTML precisa que o CORS esteja aberto
 app.use(cors());
 
-// Cache para armazenar os dados e não deixar o site vazio
 let cache = { double: [], crash: [], crash2: [] };
 
-// Função para formatar os dados como o seu HTML 'hstone' espera
+// Função de formatação exigida pelo seu cs-suite-mobile.html
 function formatToBlaze(item) {
     const colorMap = { 0: 'white', 1: 'red', 2: 'black' };
     return {
@@ -20,7 +19,6 @@ function formatToBlaze(item) {
     };
 }
 
-// Coletor de dados de fonte estável (sem bloqueio)
 function updateData() {
     https.get('https://api.casinos-fiables.com/blaze/double', (res) => {
         let data = '';
@@ -30,31 +28,27 @@ function updateData() {
                 const json = JSON.parse(data);
                 const records = json.records || json.data || json;
                 if (Array.isArray(records)) {
-                    // Aqui transformamos os dados no formato que o seu 'hstone' lê
                     cache.double = records.slice(0, 50).map(formatToBlaze);
-                    console.log(`[Lya] Sucesso: ${cache.double.length} pedras prontas.`);
+                    console.log(`[Lya] Dados carregados: ${cache.double.length}`);
                 }
-            } catch(e) { console.log("[Lya] Erro ao processar JSON."); }
+            } catch(e) {}
         });
-    }).on('error', (err) => console.log("[Lya] Erro de conexão."));
+    }).on('error', () => {});
 }
 
-// Atualiza a cada 20 segundos
 setInterval(updateData, 20000);
 updateData();
 
-// Rotas exigidas pelo seu arquivo HTML (cs-suite-mobile.html)
-app.get('/:game/history', (req, res) => {
-    res.json({ ok: true, data: cache[req.params.game] || [] });
-});
-
+// Rotas que o seu arquivo HTML chama (functions startLive e update)
+app.get('/:game/history', (req, res) => res.json({ ok: true, data: cache[req.params.game] || [] }));
 app.get('/:game/latest', (req, res) => {
     const list = cache[req.params.game] || [];
     res.json({ ok: true, data: list.slice(0, 1) });
 });
 
-app.get('/', (req, res) => {
-    res.json({ status: "Lya Proxy Online", count: cache.double.length });
-});
+// Rota de teste para o botão "TESTAR" do seu HTML
+app.get('/', (req, res) => res.json({ ok: true, status: "Proxy Lya Ativo" }));
 
-app.listen(PORT, () => console.log(`Proxy configurado para CS Suite na porta ${PORT}`));
+// IMPORTANTE: O Railway exige que usemos process.env.PORT
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log(`Servidor rodando na porta ${PORT}`));
